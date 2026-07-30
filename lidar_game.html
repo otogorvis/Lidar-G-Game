@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>LIDAR Cave Explorer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: #0f0;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border: 1px solid #0f0;
+            border-radius: 5px;
+            pointer-events: none;
+        }
+        #scan-indicator {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: #0f0;
+            font-family: 'Courier New', monospace;
+            font-size: 16px;
+            text-align: center;
+            pointer-events: none;
+        }
+        .scan-active { color: #ff0; animation: pulse 0.5s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <b>LIDAR CAVE EXPLORER</b><br>
+        WASD - Движение<br>
+        ЛКМ + Колесо - Скан / Угол луча<br>
+        ПКМ + Мышь - Поворот головы<br>
+        Shift - Ускорение<br>
+        <span id="stats">Points: 0 | FPS: 60</span>
+    </div>
+    <div id="scan-indicator">Кликни для старта</div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+        // --- Сцена и Камера ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+        scene.fog = new THREE.FogExp2(0x000000, 0.02);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        document.body.appendChild(renderer.domElement);
+
+        // --- Управление (Pointer Lock) ---
+        const controls = new PointerLockControls(camera, document.body);
+        const scanIndicator = document.getElementById('scan-indicator');
+        
+        document.addEventListener('click', () => {
+            if (!controls.isLocked) {
+                controls.lock();
+            }
+        });
+
+        controls.addEventListener('lock', () => {
+            scanIndicator.style.opacity = '1';
+            scanIndicator.textContent = "СКАНИРОВАНИЕ ВЫКЛЮЧЕНО";
+        });
+        controls.addEventListener('unlock', () => {
+            scanIndicator.style.opacity = '0.5';
+            scanIndicator.textContent = "Кликни для старта";
+        });
+
+        // --- Переменные движения ---
+        let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
+        let isSprinting = false;
+        const velocity = new THREE.Vector3();
+        const direction = new THREE.Vector3();
+        const speed = 10.0;
+        const sprintMultiplier = 2.5;
+
+        // --- Лидар Система ---
+        const lidarConfig = {
+            rays: 360,
+            maxDistance: 50,
+            rotationSpeed: 3.0,
+        };
+
+        let isScanning = false;
+        let lidarRotation = 0;
+        let currentVerticalAngle = 0;
+        
+        const particlesGeometry = new THREE.BufferGeometry();
+        const maxPoints = 50000;
+        const positions = new Float32Array(maxPoints * 3);
+        const colors = new Float32Array(maxPoints * 3);
+        
+        particlesGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
+        particlesGeometry.setAttribute('color', new THREE.BufferAttribute(colors, 3).setUsage(THREE.DynamicDrawUsage));
+        particlesGeometry.drawRange.count = 0;
+
+        const particlesMaterial = new THREE.PointsMaterial({
+            size: 0.2,
+            vertexColors: true,
+            blending: THREE.AdditiveBlending,
+            depthTest: false,
+            transparent: true,
+            opacity: 0.9
+        });
+
+        const pointCloud = new THREE.Points(particlesGeometry, particlesMaterial);
+        scene.add(pointCloud);
+
+        // Визуализация лидара
+        const lidarDeviceGeo = new THREE.CylinderGeometry(0.1, 0.1, 0.05, 16);
+        const lidarDeviceMat = new THREE.MeshBasicMaterial({ color: 0x222222 });
+        const lidarDevice = new THREE.Mesh(lidarDeviceGeo, lidarDeviceMat);
+        lidarDevice.rotation.x = Math.PI / 2;
+        camera.add(lidarDevice);
+        
+        const spinningPartGeo = new THREE.TorusGeometry(0.06, 0.01, 8, 16);
+        const spinningPartMat = new THREE.MeshBasicMaterial({ color: 0x00ff00 });
+        const spinningPart = new THREE.Mesh(spinningPartGeo, spinningPartMat);
+        spinningPart.rotation.x = Math.PI / 2;
+        lidarDevice.add(spinningPart);
+        scene.add(camera);
+
+        // --- Генерация Пещеры ---
+        const caveGroup = new THREE.Group();
+        scene.add(caveGroup);
+
+        const boxGeo = new THREE.BoxGeometry(1, 1, 1);
+        
+        function createRockTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64; canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#0a0a0a';
+            ctx.fillRect(0,0,64,64);
+            for(let i=0; i<300; i++) {
+                ctx.fillStyle = Math.random() > 0.5 ? '#1a1a1a' : '#2a2a2a';
+                ctx.fillRect(Math.random()*64, Math.random()*64, Math.random()*5+1, Math.random()*5+1);
+            }
+            const tex = new THREE.CanvasTexture(canvas);
+            tex.magFilter = THREE.NearestFilter;
+            return tex;
+        }
+        
+        const rockMat = new THREE.MeshStandardMaterial({ 
+            map: createRockTexture(), 
+            roughness: 1,
+            color: 0x333333
+        });
+
+        const obstacles = [];
+        
+        // Генерируем пещеру из блоков
+        for (let i = 0; i < 800; i++) {
+            const mesh = new THREE.Mesh(boxGeo, rockMat);
+            
+            const angle = Math.random() * Math.PI * 2;
+            const radius = 3 + Math.random() * 60;
+            const x = Math.cos(angle) * radius;
+            const z = Math.sin(angle) * radius;
+            const y = (Math.random() - 0.5) * 30;
+
+            mesh.position.set(x, y, z);
+            mesh.scale.set(2 + Math.random() * 8, 2 + Math.random() * 8, 2 + Math.random() * 8);
+            mesh.rotation.set(Math.random()*Math.PI, Math.random()*Math.PI, Math.random()*Math.PI);
+            
+            caveGroup.add(mesh);
+            obstacles.push(mesh);
+        }
+
+        // Пол и потолок
+        const floorGeo = new THREE.PlaneGeometry(300, 300);
+        const floorMat = new THREE.MeshStandardMaterial({ color: 0x0a0a0a, roughness: 1 });
+        const floor = new THREE.Mesh(floorGeo, floorMat);
+        floor.rotation.x = -Math.PI / 2;
+        floor.position.y = -15;
+        caveGroup.add(floor);
+        
+        const ceil = new THREE.Mesh(floorGeo, floorMat);
+        ceil.rotation.x = Math.PI / 2;
+        ceil.position.y = 15;
+        caveGroup.add(ceil);
+
+        // Минимальный свет
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.01);
+        scene.add(ambientLight);
+
+        // --- Обработчики событий ---
+        document.addEventListener('keydown', (e) => {
+            switch (e.code) {
+                case 'KeyW': moveForward = true; break;
+                case 'KeyA': moveLeft = true; break;
+                case 'KeyS': moveBackward = true; break;
+                case 'KeyD': moveRight = true; break;
+                case 'ShiftLeft': isSprinting = true; break;
+            }
+        });
+
+        document.addEventListener('keyup', (e) => {
+            switch (e.code) {
+                case 'KeyW': moveForward = false; break;
+                case 'KeyA': moveLeft = false; break;
+                case 'KeyS': moveBackward = false; break;
+                case 'KeyD': moveRight = false; break;
+                case 'ShiftLeft': isSprinting = false; break;
+            }
+        });
+
+        document.addEventListener('mousedown', (e) => {
+            if (e.button === 0 && controls.isLocked) {
+                isScanning = true;
+                scanIndicator.textContent = "СКАНИРОВАНИЕ АКТИВНО";
+                scanIndicator.className = "scan-active";
+            }
+        });
+
+        document.addEventListener('mouseup', (e) => {
+            if (e.button === 0) {
+                isScanning = false;
+                scanIndicator.textContent = "СКАНИРОВАНИЕ ВЫКЛЮЧЕНО";
+                scanIndicator.className = "";
+            }
+        });
+
+        document.addEventListener('wheel', (e) => {
+            if (controls.isLocked) {
+                currentVerticalAngle += e.deltaY * 0.002;
+                currentVerticalAngle = Math.max(-Math.PI/3, Math.min(Math.PI/3, currentVerticalAngle));
+            }
+        });
+
+        // --- Логика Лидара ---
+        const raycaster = new THREE.Raycaster();
+        const tempPositions = [];
+        const tempColors = [];
+
+        function updateLidar(deltaTime) {
+            if (!isScanning) {
+                particlesGeometry.drawRange.count *= 0.92;
+                if(particlesGeometry.drawRange.count < 10) particlesGeometry.drawRange.count = 0;
+                return;
+            }
+
+            lidarRotation += lidarConfig.rotationSpeed * deltaTime;
+            spinningPart.rotation.z -= lidarConfig.rotationSpeed * deltaTime;
+
+            const origin = camera.position.clone();
+            origin.y -= 0.2;
+
+            const camDir = new THREE.Vector3();
+            camera.getWorldDirection(camDir);
+            camDir.y = 0;
+            camDir.normalize();
+
+            let pointsAdded = 0;
+            const maxPointsPerFrame = 250;
+
+            for (let i = 0; i < lidarConfig.rays; i++) {
+                if (pointsAdded >= maxPointsPerFrame) break;
+
+                const yaw = lidarRotation + (i / lidarConfig.rays) * Math.PI * 2;
+                const pitch = currentVerticalAngle;
+
+                const dir = new THREE.Vector3(
+                    Math.sin(yaw) * Math.cos(pitch),
+                    Math.sin(pitch),
+                    Math.cos(yaw) * Math.cos(pitch)
+                );
+
+                const camYaw = Math.atan2(camDir.x, camDir.z);
+                dir.applyAxisAngle(new THREE.Vector3(0, 1, 0), camYaw);
+
+                raycaster.set(origin, dir);
+                raycaster.far = lidarConfig.maxDistance;
+
+                const intersects = raycaster.intersectObjects(obstacles);
+
+                if (intersects.length > 0) {
+                    const hit = intersects[0];
+                    const dist = hit.distance;
+
+                    const color = new THREE.Color();
+                    const t = Math.min(dist / lidarConfig.maxDistance, 1.0);
+                    
+                    if (t < 0.5) {
+                        color.setHSL(0.33 - t * 0.66, 1.0, 0.5);
+                    } else {
+                        color.setHSL(0.06 - (t-0.5) * 0.12, 1.0, 0.5);
+                    }
+
+                    tempPositions.push(hit.point.x, hit.point.y, hit.point.z);
+                    tempColors.push(color.r, color.g, color.b);
+                    pointsAdded++;
+                }
+            }
+
+            if (tempPositions.length > 0) {
+                const positionsAttr = particlesGeometry.attributes.position;
+                const colorsAttr = particlesGeometry.attributes.color;
+
+                const count = tempPositions.length / 3;
+                
+                for(let i=0; i<count; i++) {
+                    positionsAttr.setXYZ(i, tempPositions[i*3], tempPositions[i*3+1], tempPositions[i*3+2]);
+                    colorsAttr.setXYZ(i, tempColors[i*3], tempColors[i*3+1], tempColors[i*3+2]);
+                }
+                
+                particlesGeometry.drawRange.count = count;
+                particlesGeometry.attributes.position.needsUpdate = true;
+                particlesGeometry.attributes.color.needsUpdate = true;
+                
+                tempPositions.length = 0;
+                tempColors.length = 0;
+            }
+            
+            document.getElementById('stats').innerText = `Points: ${particlesGeometry.drawRange.count} | FPS: ${Math.round(1/deltaTime)}`;
+        }
+
+        // --- Игровой цикл ---
+        let prevTime = performance.now();
+        camera.position.y = 0;
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const time = performance.now();
+            const deltaTime = Math.min((time - prevTime) / 1000, 0.1);
+            prevTime = time;
+
+            if (controls.isLocked) {
+                velocity.x -= velocity.x * 10.0 * deltaTime;
+                velocity.z -= velocity.z * 10.0 * deltaTime;
+
+                direction.z = Number(moveForward) - Number(moveBackward);
+                direction.x = Number(moveRight) - Number(moveLeft);
+                direction.normalize();
+
+                const currentSpeed = isSprinting ? speed * sprintMultiplier : speed;
+
+                if (moveForward || moveBackward) velocity.z -= direction.z * currentSpeed * 10.0 * deltaTime;
+                if (moveLeft || moveRight) velocity.x -= direction.x * currentSpeed * 10.0 * deltaTime;
+
+                controls.moveRight(-velocity.x * deltaTime);
+                controls.moveForward(-velocity.z * deltaTime);
+                
+                if (camera.position.y < -14) camera.position.y = -14;
+                if (camera.position.y > 14) camera.position.y = 14;
+            }
+
+            updateLidar(deltaTime);
+            renderer.render(scene, camera);
+        }
+
+        animate();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+    </script>
+</body>
+</html>
